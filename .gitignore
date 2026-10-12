@@ -1,0 +1,5 @@
+.env
+work/
+__pycache__/
+*.pyc
+debug_bot.py
