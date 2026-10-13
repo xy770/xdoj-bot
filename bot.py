@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XDOJ 自动答题机器人（正式版）
-- 每天 8:00~20:59，每小时处理 N 道未做的题
-- 登录 → selectContest → 拉题 → DeepSeek 生成 C 代码
-- → g++ 本地编译 + 样例验证 → 提交 → 轮询判题 → 失败重写
+XDOJ 自动答题机器人
+- 每小时 AC 目标数：AC_PER_HOUR
+- 每题只提交一次，失败即换下一题
+- 失败的题冷却 24 小时
 """
 
 import os
@@ -26,7 +26,6 @@ try:
 except ImportError:
     from PyPDF2 import PdfReader
 
-# 加载 .env 文件（如果存在）
 load_dotenv()
 
 
@@ -38,7 +37,7 @@ def env(key, default=None):
 
 
 # ============================================================
-# 配置区（从 .env 读取）
+# 配置
 # ============================================================
 BASE_URL    = env("XDOJ_BASE_URL", "http://47.92.139.74/xdoj-ssm")
 CONTEST_ID  = env("XDOJ_CONTEST_ID", "11")
@@ -50,14 +49,16 @@ LANGUAGE_ID = env("XDOJ_LANGUAGE_ID", "2")
 DEEPSEEK_API_KEY = env("DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL   = env("DEEPSEEK_MODEL", "deepseek-chat")
 
-START_HOUR        = int(env("START_HOUR", "8"))
-END_HOUR          = int(env("END_HOUR", "20"))
-PROBLEMS_PER_HOUR = int(env("PROBLEMS_PER_HOUR", "2"))
-MAX_RETRIES       = 3
-COMPILE_TIMEOUT   = 30
-RUN_TIMEOUT       = 5
-POLL_TIMEOUT      = 180
-POLL_INTERVAL     = 3
+START_HOUR   = int(env("START_HOUR", "8"))
+END_HOUR     = int(env("END_HOUR", "20"))
+AC_PER_HOUR  = int(env("PROBLEMS_PER_HOUR", "2"))
+MAX_ATTEMPTS = int(env("MAX_ATTEMPTS", "6"))
+COOLDOWN_SEC = int(env("COOLDOWN_HOURS", "24")) * 3600
+
+COMPILE_TIMEOUT = 30
+RUN_TIMEOUT     = 5
+POLL_TIMEOUT    = 180
+POLL_INTERVAL   = 3
 
 WORK_DIR     = Path("./work")
 PROBLEMS_DIR = WORK_DIR / "problems"
@@ -82,15 +83,13 @@ client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
 
 # ============================================================
-# 登录 + selectContest
+# 登录
 # ============================================================
 def login():
-    print(f"\n[{datetime.now():%H:%M:%S}] 登录中...")
+    now = datetime.now().strftime("%H:%M:%S")
+    print(f"[{now}] 登录中...")
     try:
-        # 1) 访问首页，拿到初始 JSESSIONID
         session.get(f"{BASE_URL}/", timeout=10)
-
-        # 2) 登录
         r = session.post(
             f"{BASE_URL}/user/login.do",
             data={"userId": USER_ID, "password": PASSWORD, "preferLanguage": "zh_CN"},
@@ -104,8 +103,6 @@ def login():
         if "JSESSIONID" not in session.cookies:
             print("✘ 登录失败：未拿到 JSESSIONID")
             return False
-
-        # 3) selectContest：把 contest 对象放进 session
         session.post(
             f"{BASE_URL}/team/selectContest.do",
             data={"contestId": CONTEST_ID},
@@ -116,7 +113,7 @@ def login():
             },
             timeout=10,
         )
-        print(f"✔ 登录成功，JSESSIONID = {session.cookies.get('JSESSIONID')[:16]}...")
+        print("✔ 登录成功")
         return True
     except Exception as e:
         print(f"✘ 登录异常: {e}")
@@ -124,7 +121,7 @@ def login():
 
 
 # ============================================================
-# 拉题目列表
+# 题目列表
 # ============================================================
 def fetch_problem_list(page=1, rows=50):
     url = f"{BASE_URL}/contest/problems.do"
@@ -133,11 +130,10 @@ def fetch_problem_list(page=1, rows=50):
         "nd": int(time.time() * 1000), "rows": rows, "page": page,
         "sidx": "", "sord": "asc",
     }
-    headers = {
+    r = session.get(url, params=params, timeout=20, headers={
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Referer": f"{BASE_URL}/team/problems.do",
-    }
-    r = session.get(url, params=params, headers=headers, timeout=20)
+    })
     r.raise_for_status()
     return r.json()
 
@@ -157,7 +153,7 @@ def fetch_all_problems():
 
 
 # ============================================================
-# 下载 PDF 题目
+# PDF
 # ============================================================
 def fetch_problem_text(problem_id):
     url = f"{BASE_URL}/problem/viewTextFile.do"
@@ -167,55 +163,51 @@ def fetch_problem_text(problem_id):
     if raw.startswith(b"%PDF"):
         pdf_path = PROBLEMS_DIR / f"problem{problem_id}.pdf"
         pdf_path.write_bytes(raw)
-        return extract_pdf_text(pdf_path)
+        try:
+            reader = PdfReader(str(pdf_path))
+            return "\n".join((p.extract_text() or "") for p in reader.pages)
+        except Exception as e:
+            print(f"✘ PDF 解析失败: {e}")
+            return ""
     else:
         return raw.decode("utf-8", errors="replace")
 
 
-def extract_pdf_text(pdf_path):
-    try:
-        reader = PdfReader(str(pdf_path))
-        return "\n".join((p.extract_text() or "") for p in reader.pages)
-    except Exception as e:
-        print(f"✘ PDF 解析失败: {e}")
-        return ""
-
-
 # ============================================================
-# DeepSeek 生成代码
+# DeepSeek
 # ============================================================
-SYSTEM_PROMPT = """你是一位资深算法竞赛选手和 C 语言专家，请根据题目描述编写正确的 C 语言代码。
+SYSTEM_PROMPT = '''你是一位资深算法竞赛选手和 C 语言专家。你必须一次性写出完全正确的 C 代码。
 
-严格要求：
-1. 只输出 JSON，不要有任何额外文字、不要 markdown 代码块标记。
-2. JSON 字段：
-   - "skip"          : 布尔值。如果题目无效，设为 true 并忽略下面所有字段。
-   - "skip_reason"   : skip=true 时，简述为什么该题目无效。
-   - "code"          : 完整的 C 语言源代码（字符串）
-   - "sample_input"  : 题目给出的样例输入（字符串）
-   - "sample_output" : 对应的正确输出（字符串）
-   - "reason"        : 简要算法思路
-3. 什么情况判定为无效题目（skip=true）：
-   - 题面完全为空，或只有标题、页码、乱码
-   - 题面明确写着"测试用"、"测试题"、"样例"、"没有有效题目"、"题目无效"、"占位"等
-   - 题面没有任何可解题的描述（无输入/输出说明、无样例）
-   - 题面自相矛盾或残缺不全无法推断任务
-4. 有效的题目才需要写代码，此时要求：
-   - 纯 C 语言（C11），不要用 C++ 特性。
-   - 用 scanf / printf 标准输入输出。
-   - 效率高、内存占用小。
-   - 处理边界情况（n=0、空输入、负数、大数、多组数据）。
-   - 输出格式严格匹配（空格、换行、小数位数等）。
-   - **代码中不允许有任何注释**（// 和 /* */ 都不要）。
-5. sample_output 必须与 sample_input 严格对应。
-"""
+【输出格式】只输出 JSON，不要 markdown 代码块：
+{"skip": false, "skip_reason": "", "code": "完整 C 代码", "sample_input": "样例输入", "sample_output": "样例输出", "reason": "算法思路"}
+
+【判废题】题目内容为空、只有标题、写着"测试用/无有效题目/占位"时，返回 {"skip": true, "skip_reason": "原因"}。
+
+【写代码前必做的思考】
+1. 逐字读题面，重点看"输入说明"和"输出说明"里的每一个限制。
+2. 识别关键词，主动做输入合法性检查：
+   - "所有不合理输入返回 error" → 检查越界、重边、自环、负值、m 超过理论上限、格式错误
+   - "多组数据/读到 EOF" → 用 while(scanf(...) != EOF)
+   - "n 可达 10^5 / 10^6" → 避免 O(n^2) 空间，用邻接表而非邻接矩阵
+   - "没有自环/无重边" 是输入保证，不必检查；但若另有"不合理输入返回 error"则必须查
+3. 边界条件：n=0/1、空输入、负数、极大值、起点=终点、不连通、重复元素。
+4. 输出格式：多余空格、末尾换行、小数位数、大小写（true/True/TRUE）。
+
+【代码要求】
+- 纯 C11，不要 C++ 特性
+- 用 scanf/printf
+- 不加任何注释（// 和 /* */ 都不要）
+- 内存 O(n+m) 优先，不要动辄开 n*n 数组
+- 时间 O(n+m) 或 O((n+m) log n)
+
+【样例要求】
+- sample_output 必须与 sample_input 严格对应
+- 若题目给了样例，直接用它；若没给，自己造一个合理测试
+'''
 
 
-def ask_ai(problem_text, error_feedback=None):
-    user_msg = f"题目如下：\n\n{problem_text}\n"
-    if error_feedback:
-        user_msg += f"\n上一次尝试失败，错误信息如下，请修正后重新给出完整代码：\n{error_feedback}\n"
-
+def ask_ai(problem_text):
+    user_msg = "题目如下：\n\n" + problem_text + "\n"
     resp = client.chat.completions.create(
         model=DEEPSEEK_MODEL,
         messages=[
@@ -233,7 +225,7 @@ def ask_ai(problem_text, error_feedback=None):
 
 
 # ============================================================
-# 本地编译 + 样例验证
+# 本地编译测试
 # ============================================================
 def compile_and_test(code, sample_input, sample_output):
     with tempfile.TemporaryDirectory() as td:
@@ -244,12 +236,11 @@ def compile_and_test(code, sample_input, sample_output):
 
         cmd = ["g++", "-O2", "-x", "c", "-std=c11", str(src), "-o", str(exe), "-lm"]
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=COMPILE_TIMEOUT)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=COMPILE_TIMEOUT)
         except subprocess.TimeoutExpired:
             return False, "编译超时"
         if r.returncode != 0:
-            return False, f"编译错误：\n{r.stderr}"
+            return False, "编译错误：\n" + r.stderr
 
         stdin = sample_input or ""
         if stdin and not stdin.endswith("\n"):
@@ -271,7 +262,7 @@ def compile_and_test(code, sample_input, sample_output):
 
 
 # ============================================================
-# 提交代码
+# 提交
 # ============================================================
 def submit_code(problem_id, code):
     url = f"{BASE_URL}/submission/submit.do"
@@ -296,9 +287,6 @@ def submit_code(problem_id, code):
         return f"提交异常: {e}"
 
 
-# ============================================================
-# 轮询判题结果
-# ============================================================
 def poll_judgement(problem_id):
     url = f"{BASE_URL}/submission/results.do"
     params = {
@@ -312,21 +300,18 @@ def poll_judgement(problem_id):
         "Referer": f"{BASE_URL}/team/results.do",
     }
     start = time.time()
-    latest = None
     while time.time() - start < POLL_TIMEOUT:
         try:
             r = session.post(url, params=params, headers=headers, timeout=10)
             data = r.json().get("data", [])
             for item in data:
                 if str(item.get("problemId")) == str(problem_id):
-                    latest = item
+                    j = item.get("judgement")
+                    txt = item.get("judgementText", "Unknown")
+                    print(f"    轮询: {txt} (judgement={j})")
+                    if j != 0:
+                        return {"status": txt, "judgement": j}
                     break
-            if latest:
-                j = latest.get("judgement")
-                text = latest.get("judgementText", "Unknown")
-                print(f"    轮询: {text} (judgement={j})")
-                if j != 0:
-                    return {"status": text, "judgement": j}
         except Exception as e:
             print(f"    轮询异常: {e}")
         time.sleep(POLL_INTERVAL)
@@ -334,7 +319,7 @@ def poll_judgement(problem_id):
 
 
 # ============================================================
-# 状态管理
+# State
 # ============================================================
 def load_state():
     if STATE_FILE.exists():
@@ -342,21 +327,22 @@ def load_state():
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"done": [], "failed": {}, "history": []}
+    return {"done": [], "failed": {}, "skipped": [], "history": []}
 
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2),
-                          encoding="utf-8")
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ============================================================
-# 处理单题
+# 处理单题（只提交一次）
 # ============================================================
 def process_one_problem(problem):
     pid = problem["id"]
     title = problem.get("title", "")
-    print(f"\n{'='*60}\n处理题目 {pid} - {title}\n{'='*60}")
+    print("\n" + "=" * 60)
+    print(f"尝试题目 {pid} - {title}")
+    print("=" * 60)
 
     try:
         problem_text = fetch_problem_text(pid)
@@ -364,114 +350,140 @@ def process_one_problem(problem):
         print(f"✘ 获取题目失败: {e}")
         return False
 
-    if not problem_text or len(problem_text.strip()) < 5:
-        print("✘ 题目文本为空，跳过")
+    text = (problem_text or "").strip()
+    if len(text) < 80:
+        print(f"⚠️ 题目文本过短({len(text)})，判定废题")
+        return "SKIP"
+
+    keywords = ["输入", "输出", "样例", "Sample", "Input", "Output", "题目", "问题"]
+    if not any(kw in text for kw in keywords):
+        print("⚠️ 缺少题面关键词，判定废题")
+        return "SKIP"
+
+    (PROBLEMS_DIR / f"problem{pid}.txt").write_text(text, encoding="utf-8")
+    print(f"题目文本长度: {len(text)}")
+
+    try:
+        result = ask_ai(text)
+    except Exception as e:
+        print(f"✘ AI 调用失败: {e}")
         return False
-    print(f"题目文本长度: {len(problem_text)}")
 
-    error_feedback = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        print(f"\n--- 第 {attempt}/{MAX_RETRIES} 次尝试 ---")
-        try:
-            result = ask_ai(problem_text, error_feedback)
-        except Exception as e:
-            print(f"✘ AI 调用失败: {e}")
-            error_feedback = f"AI 调用异常：{e}"
-            time.sleep(2)
-            continue
+    attempt_dir = CODE_DIR / f"problem{pid}"
+    attempt_dir.mkdir(exist_ok=True)
+    (attempt_dir / "ai_response.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        if result.get("skip") is True:
-            reason = result.get("skip_reason", "AI 判定题目无效")
-            print(f"⚠️ AI 判定为无效题目：{reason}")
-            return "SKIP"
+    if result.get("skip") is True:
+        print("⚠️ AI 判定无效题目：" + result.get("skip_reason", ""))
+        return "SKIP"
 
-        code       = (result.get("code") or "").strip()
-        sample_in  = result.get("sample_input", "") or ""
-        sample_out = result.get("sample_output", "") or ""
+    code       = (result.get("code") or "").strip()
+    sample_in  = result.get("sample_input", "") or ""
+    sample_out = result.get("sample_output", "") or ""
+    print("AI 思路: " + result.get("reason", ""))
 
-        print(f"AI 思路: {result.get('reason', '')}")
-        if not code:
-            error_feedback = "AI 未返回 code 字段"
-            continue
+    if not code:
+        print("✘ AI 未返回代码")
+        return False
 
-        ok, msg = compile_and_test(code, sample_in, sample_out)
-        if not ok:
-            print(f"✘ 本地测试失败: {msg}")
-            error_feedback = msg
-            continue
-        print(f"✔ 本地测试通过，输出: {msg!r}")
+    ok, msg = compile_and_test(code, sample_in, sample_out)
+    if not ok:
+        print("✘ 本地测试失败（不提交）：")
+        print(msg[:400])
+        return False
+    print("✔ 本地测试通过")
 
-        # 提交
-        print("→ 提交到 OJ...")
-        sub_result = submit_code(pid, code)
-        print(f"提交响应: {sub_result}")
+    print("→ 提交到 OJ...")
+    submit_code(pid, code)
 
-        # 轮询
-        print("→ 等待判题...")
-        judge = poll_judgement(pid)
-        print(f"判题结果: {judge['status']}")
+    print("→ 等待判题...")
+    judge = poll_judgement(pid)
+    print("判题结果: " + judge["status"])
 
-        if judge["judgement"] == 1:
-            print(f"✔✔ 题目 {pid} 通过！")
-            (CODE_DIR / f"problem{pid}.c").write_text(code, encoding="utf-8")
-            return True
-        else:
-            error_feedback = (f"OJ 判题结果: {judge['status']}。"
-                              f"请检查边界条件、输出格式或算法复杂度。")
-            print(f"✘ OJ 未通过：{judge['status']}")
-
-    print(f"✘ 题目 {pid} 重试 {MAX_RETRIES} 次后仍失败")
+    if judge["judgement"] == 1:
+        print(f"✔✔ 题目 {pid} 通过！")
+        (attempt_dir / "accepted.c").write_text(code, encoding="utf-8")
+        return True
+    print(f"✘ OJ 未通过：{judge['status']}")
     return False
 
 
 # ============================================================
-# 一轮：每小时做 N 道题
+# 一轮
 # ============================================================
 def run_once():
     if not login():
         return
     state = load_state()
-    done_set = set(state.get("done", []))
+    done_set    = set(state.get("done", []))
+    skipped_set = set(state.get("skipped", []))
+    failed      = state.get("failed", {})
+    now_ts      = time.time()
 
-    print(f"\n[{datetime.now():%H:%M:%S}] 获取题目列表...")
+    cooldown_ids = set()
+    for pid_str, info in failed.items():
+        if isinstance(info, dict):
+            if now_ts - info.get("last_time", 0) < COOLDOWN_SEC:
+                try:
+                    cooldown_ids.add(int(pid_str))
+                except ValueError:
+                    pass
+
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 获取题目列表...")
     problems = fetch_all_problems()
-    pending = [p for p in problems if p["id"] not in done_set]
-    print(f"共 {len(problems)} 题，已完成 {len(done_set)}，待处理 {len(pending)}")
+    pending = [p for p in problems
+               if p["id"] not in done_set
+               and p["id"] not in skipped_set
+               and p["id"] not in cooldown_ids]
+    print(f"共 {len(problems)} 题 | 已完成 {len(done_set)} | 废题 {len(skipped_set)} "
+          f"| 冷却中 {len(cooldown_ids)} | 待处理 {len(pending)}")
+    print(f"目标：本小时 AC {AC_PER_HOUR} 道，最多尝试 {MAX_ATTEMPTS} 道\n")
 
-    if not pending:
-        print("没有待处理题目")
-        return
+    ac_count = 0
+    attempted = 0
 
-    for _ in range(PROBLEMS_PER_HOUR):
-        if not pending:
-            break
+    while ac_count < AC_PER_HOUR and pending and attempted < MAX_ATTEMPTS:
+        attempted += 1
         p = pending.pop(0)
         try:
-            ok = process_one_problem(p)
+            result = process_one_problem(p)
         except Exception as e:
             print(f"✘ 处理题目 {p['id']} 异常: {e}")
-            ok = False
+            result = False
 
-        if ok:
+        if result == "SKIP":
+            skipped_set.add(p["id"])
+            state["skipped"] = sorted(skipped_set)
+        elif result is True:
             done_set.add(p["id"])
             state["done"] = sorted(done_set)
+            ac_count += 1
+            print(f"\n✔ 本小时进度: AC {ac_count}/{AC_PER_HOUR}（已尝试 {attempted} 道）")
         else:
-            fails = state.setdefault("failed", {})
-            fails[str(p["id"])] = fails.get(str(p["id"]), 0) + 1
+            info = failed.get(str(p["id"]), {})
+            cnt = info.get("count", 0) if isinstance(info, dict) else 0
+            failed[str(p["id"])] = {"count": cnt + 1, "last_time": now_ts}
 
+        state["failed"] = failed
         state.setdefault("history", []).append({
             "id": p["id"], "title": p.get("title"),
             "time": datetime.now().isoformat(),
-            "status": "ok" if ok else "fail",
+            "status": "ok" if result is True else ("skip" if result == "SKIP" else "fail"),
         })
         save_state(state)
+
+    if ac_count >= AC_PER_HOUR:
+        print(f"\n🎉 本小时完成 {ac_count} 道 AC")
+    else:
+        print(f"\n⚠️ 本小时只完成 {ac_count} 道 AC（尝试了 {attempted} 道）")
 
 
 # ============================================================
 # 调度器
 # ============================================================
 def scheduler():
-    print(f"启动调度：每天 {START_HOUR}:00 - {END_HOUR}:59，每小时 {PROBLEMS_PER_HOUR} 道")
+    print(f"启动调度：每天 {START_HOUR}:00 - {END_HOUR}:59，每小时 AC {AC_PER_HOUR} 道")
     while True:
         now = datetime.now()
         if START_HOUR <= now.hour <= END_HOUR:
@@ -483,7 +495,7 @@ def scheduler():
         next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         sleep_secs = max(5, (next_hour - datetime.now()).total_seconds())
         nxt = datetime.now() + timedelta(seconds=sleep_secs)
-        print(f"\n[{datetime.now():%H:%M:%S}] 休眠至 {nxt:%H:%M:%S}")
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 休眠至 {nxt.strftime('%H:%M:%S')}")
         time.sleep(sleep_secs)
 
 
@@ -492,8 +504,8 @@ def scheduler():
 # ============================================================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--once", action="store_true", help="只跑一轮")
-    ap.add_argument("--problem-id", type=int, help="只做指定题目")
+    ap.add_argument("--once", action="store_true", help="跑一轮后退出")
+    ap.add_argument("--problem-id", type=int, help="只处理指定题目")
     ap.add_argument("--list", action="store_true", help="只拉题目列表")
     args = ap.parse_args()
 
@@ -514,7 +526,7 @@ def main():
             print(f"未找到题目 {args.problem_id}")
             return
         ok = process_one_problem(target)
-        if ok:
+        if ok is True:
             state = load_state()
             done = set(state.get("done", []))
             done.add(args.problem_id)
