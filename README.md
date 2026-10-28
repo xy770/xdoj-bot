@@ -31,7 +31,7 @@ pip install requests openai python-dotenv pypdf
 ```ini
 # XDOJ 账号
 XDOJ_BASE_URL=http://47.92.139.74/xdoj-ssm
-XDOJ_CONTEST_ID=11
+XDOJ_CONTEST_ID=your_contest_id
 XDOJ_USER_ID=your_id
 XDOJ_PASSWORD=your_password
 XDOJ_CLASS_ID=your_class_id
