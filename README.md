@@ -99,6 +99,7 @@ work/
 - 扫描版或特殊字体的 PDF 可能无法提取文本，将被判定为无效题目
 - 判题轮询通过 `problemId` 匹配最新记录，建议 `PROBLEMS_PER_HOUR` 不宜过大
 - 仅在 `START_HOUR` 至 `END_HOUR` 时间窗口内执行任务
+- 需要填写正确的 `CONTEST_ID`
 
 ## 免责声明
 
